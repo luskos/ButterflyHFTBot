@@ -1,0 +1,1 @@
+I thought about this bot on the principle of making ribbons out of MA's and i thought if i make mirror anti-ribbon and enter positions wherever they meet...It's HFT 1s timeframe bot that catches long trades with good accuracy.
