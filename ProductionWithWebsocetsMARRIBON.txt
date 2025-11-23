@@ -1,0 +1,518 @@
+import os
+import time
+import csv
+import logging
+from datetime import datetime
+from enum import Enum
+from dotenv import load_dotenv
+import pandas as pd
+import numpy as np
+import json
+import threading
+from websocket import WebSocketApp
+
+from binance.client import Client
+from binance.enums import *
+from binance.exceptions import BinanceAPIException
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+load_dotenv()
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+
+SYMBOL = "SUIUSDC"
+SYMBOL_WS = "siusdc"  # WebSocket symbol (lowercase)
+MAX_LEVERAGE = 2
+LOOKBACK = 300
+TRADE_LOG = "futures_ribbon_trades.csv"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+
+# ============================================================
+# ENUM
+# ============================================================
+
+class PositionType(Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+    FLAT = "FLAT"
+
+# ============================================================
+# BOT WITH WEBSOCKETS
+# ============================================================
+
+class FuturesRibbonBot:
+    def __init__(self):
+        self.client = Client(API_KEY, API_SECRET)
+        self.ws = None
+        self.ws_running = False
+        
+        # Data storage for WebSocket
+        self.latest_price = None
+        self.price_history = []
+        self.df = None
+        self.data_ready = False
+        
+        # Initialize with historical data
+        self.initialize_historical_data()
+
+        # Leverage
+        try:
+            self.client.futures_change_leverage(symbol=SYMBOL, leverage=MAX_LEVERAGE)
+            logging.info(f"[INIT] Leverage = {MAX_LEVERAGE}")
+        except Exception as e:
+            logging.error(f"[LEVERAGE ERROR] {e}")
+
+        # State
+        self.position = PositionType.FLAT
+        self.entry_price = 0.0
+        self.entry_time = None
+        self.qty = 0.0
+
+        # CSV
+        if not os.path.exists(TRADE_LOG):
+            with open(TRADE_LOG, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "entry_time", "exit_time", "side",
+                    "qty", "entry_price", "exit_price",
+                    "pnl", "wallet_after"
+                ])
+
+    def initialize_historical_data(self):
+        """Initialize with historical data before starting WebSocket"""
+        try:
+            klines = self.client.get_klines(
+                symbol=SYMBOL,
+                interval=Client.KLINE_INTERVAL_1MINUTE,
+                limit=LOOKBACK
+            )
+            df = pd.DataFrame(klines, columns=[
+                'timestamp','open','high','low','close','volume',
+                'close_time','qab','not','tbb','tbq','ignore'
+            ])
+            df["close"] = df["close"].astype(float)
+            self.df = df
+            self.latest_price = df['close'].iloc[-1]
+            self.data_ready = True
+            logging.info(f"✅ Historical data loaded. Latest price: {self.latest_price}")
+        except Exception as e:
+            logging.error(f"❌ Failed to load historical data: {e}")
+
+    def on_message(self, ws, message):
+        """Handle incoming WebSocket messages"""
+        try:
+            data = json.loads(message)
+            
+            if 'e' in data and data['e'] == 'aggTrade':
+                # AggTrade event
+                price = float(data['p'])
+                self.latest_price = price
+                self.update_price_history(price)
+                
+            elif 'result' not in data:  # Ignore subscription confirmations
+                logging.debug(f"WebSocket message: {data}")
+                
+        except Exception as e:
+            logging.error(f"WebSocket message error: {e}")
+
+    def update_price_history(self, new_price):
+        """Update price history and DataFrame with new price"""
+        current_time = datetime.utcnow()
+        
+        # Create new row (simulating 1-minute candles)
+        new_row = {
+            'timestamp': current_time,
+            'open': new_price,
+            'high': new_price, 
+            'low': new_price,
+            'close': new_price,
+            'volume': 0,
+            'close_time': None,
+            'qab': 0,
+            'not': 0,
+            'tbb': 0,
+            'tbq': 0,
+            'ignore': 0
+        }
+        
+        # Update DataFrame (keep last LOOKBACK rows)
+        if self.df is not None:
+            # For simplicity, we'll just update the last row with new price
+            # In production, you'd want proper candle aggregation
+            self.df.iloc[-1] = pd.Series(new_row)
+        else:
+            self.df = pd.DataFrame([new_row])
+
+    def on_error(self, ws, error):
+        """Handle WebSocket errors"""
+        logging.error(f"WebSocket error: {error}")
+
+    def on_close(self, ws, close_status_code, close_msg):
+        """Handle WebSocket closure"""
+        logging.info("WebSocket connection closed")
+        self.ws_running = False
+
+    def on_open(self, ws):
+        """Handle WebSocket opening"""
+        logging.info("✅ WebSocket connected")
+        self.ws_running = True
+
+    def start_websocket(self):
+        """Start WebSocket connection"""
+        stream_url = f"wss://fstream.binance.com/ws/{SYMBOL_WS}@aggTrade"
+        
+        self.ws = WebSocketApp(
+            stream_url,
+            on_message=self.on_message,
+            on_error=self.on_error,
+            on_close=self.on_close,
+            on_open=self.on_open
+        )
+        
+        # Run WebSocket in a separate thread
+        ws_thread = threading.Thread(target=self.ws.run_forever)
+        ws_thread.daemon = True
+        ws_thread.start()
+        
+        # Wait for connection
+        timeout = 10
+        start_time = time.time()
+        while not self.ws_running and (time.time() - start_time) < timeout:
+            time.sleep(0.1)
+        
+        if self.ws_running:
+            logging.info("✅ WebSocket started successfully")
+        else:
+            logging.error("❌ WebSocket failed to start")
+
+    # ============================================================
+    # EXCHANGE HELPERS
+    # ============================================================
+
+    def wallet_balance(self):
+        try:
+            info = self.client.futures_account()
+            return float(info["totalWalletBalance"])
+        except:
+            return 0.0
+
+    def futures_price(self):
+        return self.latest_price if self.latest_price else 0.0
+
+    def get_step_size(self):
+        info = self.client.futures_exchange_info()
+        for s in info["symbols"]:
+            if s["symbol"] == SYMBOL:
+                for f in s["filters"]:
+                    if f["filterType"] == "LOT_SIZE":
+                        step = float(f["stepSize"])
+                        return abs(int(np.log10(step)))
+        return 3
+
+    def truncate(self, val, n):
+        return np.floor(val * 10**n) / 10**n
+
+    def get_open_position(self):
+        try:
+            pos = self.client.futures_position_information(symbol=SYMBOL)
+            for p in pos:
+                amt = float(p["positionAmt"])
+                if amt != 0:
+                    return (
+                        PositionType.LONG if amt > 0 else PositionType.SHORT,
+                        abs(amt),
+                        float(p["entryPrice"])
+                    )
+        except:
+            pass
+        return PositionType.FLAT, 0.0, 0.0
+
+    def open_order(self, side, qty):
+        try:
+            self.client.futures_create_order(
+                symbol=SYMBOL,
+                side=SIDE_BUY if side == PositionType.LONG else SIDE_SELL,
+                type=ORDER_TYPE_MARKET,
+                quantity=qty
+            )
+            return True
+        except Exception as e:
+            logging.error(f"[OPEN ERROR] {e}")
+            return False
+
+    def close_order(self, side, qty):
+        opposite = SIDE_SELL if side == PositionType.LONG else SIDE_BUY
+        try:
+            self.client.futures_create_order(
+                symbol=SYMBOL,
+                side=opposite,
+                type=ORDER_TYPE_MARKET,
+                quantity=qty
+            )
+            return True
+        except Exception as e:
+            logging.error(f"[CLOSE ERROR] {e}")
+            return False
+
+    # ============================================================
+    # TRADING LOGIC (SAME AS BEFORE)
+    # ============================================================
+
+    def calculate_ribbons(self, prices):
+        """EXACT SAME RIBBON CALCULATION"""
+        # Regular ribbon - EXACT SAME PERIODS
+        regular_periods = [2, 4, 6, 8, 10, 12]
+        regular_ribbon = {}
+        for period in regular_periods:
+            regular_ribbon[f'MA_{period}'] = prices.rolling(window=period, min_periods=1).mean()
+        
+        # Anti-ribbon - EXACT SAME PERIODS AND CALCULATION
+        anti_periods = [3, 5, 7, 9, 11, 13]
+        anti_ribbon = {}
+        for period in anti_periods:
+            anti_ribbon[f'Anti_MA_{period}'] = prices.rolling(window=period).apply(
+                lambda x: (x.mean() * 0.4 + x.median() * 0.6)
+            )
+        
+        return regular_ribbon, anti_ribbon
+
+    def calculate_trading_signals(self, df, regular_ribbon, anti_ribbon):
+        """EXACT SAME SIGNAL GENERATION LOGIC AS PAPER BOT"""
+        if df is None or len(df) < 20:
+            return PositionType.FLAT, 0, [], 0, 0
+            
+        regular_avg = pd.DataFrame(regular_ribbon).mean(axis=1)
+        anti_avg = pd.DataFrame(anti_ribbon).mean(axis=1)
+        current_price = df['close'].iloc[-1]
+        
+        # Current values
+        current_regular = regular_avg.iloc[-1]
+        current_anti = anti_avg.iloc[-1]
+        current_spread = current_regular - current_anti
+        convergence = abs(current_regular - current_anti)
+        
+        # Signal strength based on multiple factors - EXACT SAME WEIGHTS
+        signals = []
+        
+        # 1. Convergence signal (strong when ribbons are close) - EXACT SAME THRESHOLDS
+        if convergence < 0.0005:  # Very close convergence
+            signals.append(("STRONG_CONVERGENCE", 2.0))
+        elif convergence < 0.001:  # Moderate convergence
+            signals.append(("CONVERGENCE", 1.0))
+        
+        # 2. Price position relative to ribbons - EXACT SAME LOGIC
+        if current_price > current_regular and current_price > current_anti:
+            signals.append(("PRICE_ABOVE_BOTH", 1.5))
+        elif current_price < current_regular and current_price < current_anti:
+            signals.append(("PRICE_BELOW_BOTH", 1.5))
+        
+        # 3. Ribbon crossover momentum - EXACT SAME LOGIC
+        if len(regular_avg) > 10:
+            # Check if spread is increasing/decreasing
+            spread_trend = current_spread - (regular_avg.iloc[-5] - anti_avg.iloc[-5])
+            if abs(spread_trend) > 0.0003:
+                signals.append(("MOMENTUM", 1.2 if spread_trend > 0 else -1.2))
+        
+        # 4. Recent price momentum - EXACT SAME LOGIC
+        if len(df) > 5:
+            price_change = (current_price / df['close'].iloc[-5] - 1) * 100
+            if abs(price_change) > 0.1:  # 0.1% change in 5 periods
+                signals.append(("PRICE_MOMENTUM", 1.1 if price_change > 0 else -1.1))
+        
+        # Calculate overall signal score - EXACT SAME CALCULATION
+        total_score = sum(score for _, score in signals)
+        
+        # Determine position type - EXACT SAME THRESHOLDS
+        if total_score > 1.5:
+            return PositionType.LONG, total_score, signals, convergence, current_spread
+        elif total_score < -1.5:
+            return PositionType.SHORT, total_score, signals, convergence, current_spread
+        else:
+            return PositionType.FLAT, total_score, signals, convergence, current_spread
+
+    def calculate_position_size(self, current_price, signal_strength):
+        """EXACT SAME POSITION SIZING LOGIC AS PAPER BOT"""
+        bal = self.wallet_balance()
+        risk_per_trade = 1  # 100% of balance per trade (SAME AS PAPER BOT)
+        base_size = bal * risk_per_trade / current_price
+        
+        # Adjust size based on signal strength - EXACT SAME LOGIC
+        strength_multiplier = min(abs(signal_strength) / 3.0, 1.0)
+        final_size = base_size * strength_multiplier
+        
+        # Apply futures precision
+        final_size = self.truncate(final_size, self.get_step_size())
+        return final_size
+
+    def enter_position(self, side, price, signal_strength):
+        """EXACT SAME ENTRY LOGIC AS PAPER BOT"""
+        qty = self.calculate_position_size(price, signal_strength)
+        if self.open_order(side, qty):
+            self.position = side
+            self.qty = qty
+            self.entry_price = price
+            self.entry_time = datetime.utcnow()
+            logging.info(f"🟢 ENTER {side.value} | Size: {qty:.4f} | Price: {price:.6f} | Signal: {signal_strength:.2f}")
+
+    def exit_position(self, price):
+        """EXACT SAME EXIT LOGIC AS PAPER BOT"""
+        if self.position == PositionType.FLAT:
+            return
+
+        side = self.position
+        qty = self.qty
+
+        if self.close_order(side, qty):
+            # Calculate PnL - EXACT SAME CALCULATION
+            if side == PositionType.LONG:
+                pnl = (price - self.entry_price) * qty
+            else:  # SHORT
+                pnl = (self.entry_price - price) * qty
+                
+            bal = self.wallet_balance()
+
+            # Record trade
+            with open(TRADE_LOG, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    self.entry_time,
+                    datetime.utcnow(),
+                    side.value,
+                    qty,
+                    self.entry_price,
+                    price,
+                    pnl,
+                    bal
+                ])
+
+            # Calculate time in position
+            time_in_position = (datetime.utcnow() - self.entry_time).total_seconds()
+            
+            logging.info(f"🔴 EXIT {side.value} | PnL: ${pnl:.4f} | Time: {time_in_position:.1f}s | Balance: ${bal:.4f}")
+
+            # Reset position
+            self.position = PositionType.FLAT
+            self.qty = 0.0
+            self.entry_price = 0.0
+            self.entry_time = None
+
+    def get_unrealized_pnl(self, current_price):
+        """EXACT SAME UNREALIZED PnL CALCULATION"""
+        if self.position == PositionType.FLAT:
+            return 0.0
+        
+        if self.position == PositionType.LONG:
+            return (current_price - self.entry_price) * self.qty
+        else:  # SHORT
+            return (self.entry_price - current_price) * self.qty
+
+    def print_second_by_second_data(self, current_price, position_signal, signal_strength, signals, convergence, spread, unrealized_pnl):
+        """EXACT SAME LOGGING FORMAT AS PAPER BOT"""
+        timestamp = datetime.utcnow().strftime("%H:%M:%S")
+        
+        logging.info(f"[{timestamp}] PRICE: {current_price:.6f} | POSITION: {self.position.value} | SIGNAL: {position_signal.value}")
+        logging.info(f"    Signal Strength: {signal_strength:.2f} | Convergence: {convergence:.6f} | Spread: {spread:.6f}")
+        logging.info(f"    Balance: ${self.wallet_balance():.4f} | Unrealized PnL: ${unrealized_pnl:.4f}")
+        
+        # Print active signals
+        if signals:
+            signal_names = [f"{name}({score:.1f})" for name, score in signals]
+            logging.info(f"    Active Signals: {', '.join(signal_names)}")
+        
+        # Print position details if in trade
+        if self.position != PositionType.FLAT:
+            time_in_pos = (datetime.utcnow() - self.entry_time).total_seconds()
+            logging.info(f"    Entry Price: {self.entry_price:.6f} | Time in Position: {time_in_pos:.1f}s")
+
+    # ============================================================
+    # MAIN LOOP WITH WEBSOCKETS
+    # ============================================================
+
+    def run(self):
+        logging.info("Starting Futures Ribbon Bot with WebSockets...")
+        logging.info("="*50)
+        logging.info(f"Symbol: {SYMBOL}")
+        logging.info(f"Initial Balance: ${self.wallet_balance():.2f}")
+        logging.info("Running indefinitely... Press Ctrl+C to stop")
+        logging.info("="*50)
+        
+        # Start WebSocket
+        self.start_websocket()
+        
+        if not self.ws_running:
+            logging.error("❌ Cannot start bot - WebSocket connection failed")
+            return
+
+        try:
+            last_calculation_time = 0
+            calculation_interval = 1  # Calculate signals every 1 second
+            
+            while self.ws_running:
+                current_time = time.time()
+                
+                # Calculate signals at specified interval
+                if current_time - last_calculation_time >= calculation_interval:
+                    if self.data_ready and self.latest_price is not None:
+                        current_price = self.latest_price
+                        
+                        # Calculate ribbons and signals
+                        regular_ribbon, anti_ribbon = self.calculate_ribbons(self.df['close'])
+                        position_signal, signal_strength, signals, convergence, spread = self.calculate_trading_signals(
+                            self.df, regular_ribbon, anti_ribbon
+                        )
+                        
+                        # Get unrealized PnL
+                        unrealized_pnl = self.get_unrealized_pnl(current_price)
+                        
+                        # Sync with exchange position
+                        exch_side, exch_qty, exch_entry = self.get_open_position()
+                        if exch_side != PositionType.FLAT and self.position == PositionType.FLAT:
+                            self.position = exch_side
+                            self.qty = exch_qty
+                            self.entry_price = exch_entry
+                        
+                        # PRINT DATA EVERY SECOND - EXACT SAME FORMAT
+                        self.print_second_by_second_data(current_price, position_signal, signal_strength, 
+                                                       signals, convergence, spread, unrealized_pnl)
+                        
+                        # EXACT SAME POSITION MANAGEMENT LOGIC AS PAPER BOT
+                        if self.position == PositionType.FLAT:
+                            # Consider entering new position
+                            if position_signal != PositionType.FLAT:
+                                self.enter_position(position_signal, current_price, signal_strength)
+                        
+                        else:
+                            # EXACT SAME EXIT LOGIC: ONLY EXIT WHEN SIGNAL REVERSES
+                            if (position_signal == PositionType.FLAT or 
+                                (self.position == PositionType.LONG and position_signal == PositionType.SHORT) or
+                                (self.position == PositionType.SHORT and position_signal == PositionType.LONG)):
+                                
+                                self.exit_position(current_price)
+                    
+                    last_calculation_time = current_time
+                
+                time.sleep(0.1)  # Small sleep to prevent CPU overload
+
+        except KeyboardInterrupt:
+            logging.info("\nStopping futures trading...")
+        
+        finally:
+            # Close WebSocket
+            if self.ws:
+                self.ws.close()
+            
+            # Close any open position
+            if self.position != PositionType.FLAT:
+                self.exit_position(self.futures_price())
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+    bot = FuturesRibbonBot()
+    bot.run()
