@@ -1,0 +1,384 @@
+import time
+import numpy as np
+import pandas as pd
+from enum import Enum
+from datetime import datetime
+from binance.client import Client
+
+# ==========================================================
+# CONFIG
+# ==========================================================
+SYMBOL = "SUIUSDC"
+LOOKBACK_1S = 200
+LOOKBACK_1M = 300
+
+TP_PERCENT = 0.5      # +0.5% TP
+SL_PERCENT = -0.25    # -0.25% SL
+
+client = Client()
+
+
+# ==========================================================
+# ENUM FOR POSITION TYPE
+# ==========================================================
+class PositionType(Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+    FLAT = "FLAT"
+
+
+# ==========================================================
+# HYBRID TREND BOT
+# ==========================================================
+class HybridTrendBot:
+    def __init__(self, symbol=SYMBOL, initial_balance=100.0):
+        self.symbol = symbol
+        self.initial_balance = initial_balance
+        self.balance = initial_balance
+
+        # Position
+        self.position = PositionType.FLAT
+        self.entry_price = None
+        self.entry_time = None
+        self.position_size = 0.0
+
+        # Stats
+        self.trades = []
+        self.wins = 0
+        self.losses = 0
+        self.max_win = 0.0
+        self.max_loss = 0.0
+        self.total_pnl = 0.0
+
+        self.win_amounts = []
+        self.loss_amounts = []
+        self.holding_times = []
+
+    # ======================================================
+    # GET 1-second and 1-minute prices
+    # ======================================================
+    def get_prices_1s(self, limit=LOOKBACK_1S):
+        try:
+            klines = client.get_klines(
+                symbol=self.symbol,
+                interval="1s",
+                limit=limit
+            )
+            return [float(k[4]) for k in klines]
+        except:
+            return None
+
+    def get_prices_1m(self, limit=LOOKBACK_1M):
+        try:
+            klines = client.get_klines(
+                symbol=self.symbol,
+                interval=Client.KLINE_INTERVAL_1MINUTE,
+                limit=limit
+            )
+            return [float(k[4]) for k in klines]
+        except:
+            return None
+
+    # ======================================================
+    # RIBBON CALCULATIONS
+    # ======================================================
+    def calculate_ribbons(self, prices):
+        s = pd.Series(prices)
+
+        # Regular ribbon
+        periods_regular = [2, 4, 6, 8, 10, 12]
+        regular = pd.DataFrame({f"MA{p}": s.rolling(p).mean() for p in periods_regular})
+
+        # Anti-ribbon
+        periods_anti = [3, 5, 7, 9, 11, 13]
+        anti = pd.DataFrame({
+            f"ANTI{p}": s.rolling(p).apply(lambda x: x.mean() * 0.4 + x.median() * 0.6)
+            for p in periods_anti
+        })
+
+        regular_avg = regular.mean(axis=1)
+        anti_avg = anti.mean(axis=1)
+        return regular_avg, anti_avg
+
+    # ======================================================
+    # MACD DIF 12/26
+    # ======================================================
+    def compute_macd_dif(self, prices):
+        s = pd.Series(prices)
+        ema12 = s.ewm(span=12).mean()
+        ema26 = s.ewm(span=26).mean()
+        return (ema12 - ema26).iloc[-1]
+
+    # ======================================================
+    # MA99 SLOPE (1m)
+    # ======================================================
+    def compute_ma99_slope(self, prices):
+        s = pd.Series(prices)
+        ma99 = s.rolling(99).mean()
+        last6 = ma99.iloc[-6:]
+
+        if last6.isna().any():
+            return None, True, True
+
+        slope_up = last6.iloc[-1] > last6.iloc[0]
+        slope_range = last6.max() - last6.min()
+
+        flat = slope_range < prices[-1] * 0.00005
+        return ma99.iloc[-1], flat, slope_up
+
+    # ======================================================
+    # MA99 SPLIT TREND (1s)
+    # ======================================================
+    def ma99_split_trend(self, prices_1s):
+        s = pd.Series(prices_1s)
+        ma99 = s.rolling(99).mean().iloc[-48:]
+
+        first = ma99[:24]
+        last = ma99[24:]
+
+        sum_first = first.sum()
+        sum_last = last.sum()
+
+        if sum_last > sum_first:
+            return "UP"
+        elif sum_last < sum_first:
+            return "DOWN"
+        else:
+            return "FLAT"
+
+    # ======================================================
+    # RIBBON SIGNALING
+    # ======================================================
+    def ribbon_signal(self, regular_avg, anti_avg, prices):
+        current_price = prices[-1]
+        reg = regular_avg.iloc[-1]
+        ant = anti_avg.iloc[-1]
+
+        signals = []
+        score = 0
+
+        # Convergence
+        conv = abs(reg - ant)
+        if conv < 0.0005:
+            score += 2
+        elif conv < 0.001:
+            score += 1
+
+        # Price relative to ribbons
+        if current_price > reg and current_price > ant:
+            score += 1.5
+        elif current_price < reg and current_price < ant:
+            score -= 1.5
+
+        # 5s momentum
+        if len(prices) > 5:
+            change = (current_price / prices[-5] - 1) * 100
+            if abs(change) > 0.1:
+                score += 1.1 if change > 0 else -1.1
+
+        # Spread momentum
+        if len(regular_avg) > 5:
+            spread_now = reg - ant
+            spread_prev = regular_avg.iloc[-5] - anti_avg.iloc[-5]
+            trend = spread_now - spread_prev
+            if abs(trend) > 0.0003:
+                score += 1.2 if trend > 0 else -1.2
+
+        # Output
+        if score > 1.5:
+            return PositionType.LONG, score
+        elif score < -1.5:
+            return PositionType.SHORT, score
+        else:
+            return PositionType.FLAT, score
+
+    # ======================================================
+    # ENTRY LOGIC (Variant A)
+    # ======================================================
+    def attempt_entry(self, price, ribbon_sig, ribbon_score,
+                      dif, slope_up, split_trend):
+
+        # Combined conditions (Variant A → ALL must be TRUE)
+        if ribbon_sig == PositionType.LONG:
+            if dif > 0 and slope_up and split_trend == "UP":
+                return PositionType.LONG
+
+        if ribbon_sig == PositionType.SHORT:
+            if dif < 0 and not slope_up and split_trend == "DOWN":
+                return PositionType.SHORT
+
+        return PositionType.FLAT
+
+    # ======================================================
+    # ENTER POSITION
+    # ======================================================
+    def enter_position(self, pos_type, price):
+        self.position = pos_type
+        self.entry_price = price
+        self.entry_time = datetime.now()
+        self.position_size = self.balance / price
+
+        print(f"\n🟢 ENTER {pos_type.value} @ {price:.6f} | Size: {self.position_size:.4f}")
+
+    # ======================================================
+    # EXIT POSITION
+    # ======================================================
+    def exit_position(self, price, reason=""):
+        if self.position == PositionType.FLAT:
+            return
+
+        # PNL
+        if self.position == PositionType.LONG:
+            pnl = (price - self.entry_price) * self.position_size
+        else:
+            pnl = (self.entry_price - price) * self.position_size
+
+        self.total_pnl += pnl
+        self.balance += pnl
+
+        # Stats update
+        if pnl > 0:
+            self.wins += 1
+            self.win_amounts.append(pnl)
+            if pnl > self.max_win:
+                self.max_win = pnl
+        else:
+            self.losses += 1
+            self.loss_amounts.append(pnl)
+            if pnl < self.max_loss:
+                self.max_loss = pnl
+
+        time_in_pos = (datetime.now() - self.entry_time).total_seconds()
+        self.holding_times.append(time_in_pos)
+
+        print(f"\n🔴 EXIT {self.position.value} @ {price:.6f}")
+        print(f"💰 PNL: {pnl:.6f}   |  Reason: {reason}")
+        print(f"💳 Balance Now: {self.balance:.6f}")
+        print(f"⌛ Held: {time_in_pos:.1f}s\n")
+
+        # =============== TRADE SUMMARY ===============
+        self.print_trade_summary()
+
+        # Reset
+        self.position = PositionType.FLAT
+        self.entry_price = None
+        self.entry_time = None
+        self.position_size = 0.0
+
+    # ======================================================
+    # TRADE SUMMARY
+    # ======================================================
+    def print_trade_summary(self):
+        total_trades = self.wins + self.losses
+        win_rate = (self.wins / total_trades * 100) if total_trades else 0
+
+        avg_win = np.mean(self.win_amounts) if self.win_amounts else 0
+        avg_loss = np.mean(self.loss_amounts) if self.loss_amounts else 0
+        avg_time = np.mean(self.holding_times) if self.holding_times else 0
+
+        profit_factor = (
+            abs(sum(self.win_amounts) / sum(self.loss_amounts))
+            if self.loss_amounts else float("inf")
+        )
+
+        print("📊 TRADE SUMMARY")
+        print("──────────────────────────────────────────────")
+        print(f"Trades: {total_trades} | Wins: {self.wins} | Losses: {self.losses}")
+        print(f"Success Ratio: {win_rate:.2f}%")
+        print(f"Avg Win: {avg_win:.6f} | Avg Loss: {avg_loss:.6f}")
+        print(f"Profit Factor: {profit_factor:.3f}")
+        print(f"Best Trade (Run-Up): {self.max_win:.6f}")
+        print(f"Worst Trade (Drawdown): {self.max_loss:.6f}")
+        print(f"Avg Time in Trade: {avg_time:.1f}s")
+        print("──────────────────────────────────────────────\n")
+
+    # ======================================================
+    # MAIN LOOP
+    # ======================================================
+    def run(self):
+        print("\n🚀 STARTING HYBRID TREND BOT")
+        print(f"Initial Balance: {self.balance}\n")
+
+        while True:
+            # 1-second data
+            prices_1s = self.get_prices_1s()
+            if not prices_1s or len(prices_1s) < 150:
+                print("Waiting for 1s data...")
+                time.sleep(1)
+                continue
+
+            # 1-minute data
+            prices_1m = self.get_prices_1m()
+            if not prices_1m or len(prices_1m) < 110:
+                print("Waiting for 1m data...")
+                time.sleep(1)
+                continue
+
+            price = prices_1s[-1]
+
+            # Indicators
+            reg, ant = self.calculate_ribbons(prices_1s)
+            dif = self.compute_macd_dif(prices_1m)
+            ma99, flat, slope_up = self.compute_ma99_slope(prices_1m)
+            split = self.ma99_split_trend(prices_1s)
+
+            ribbon_signal_type, ribbon_score = self.ribbon_signal(reg, ant, prices_1s)
+
+            # PRINT STATUS
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Price: {price:.6f}")
+            print(f"Ribbon Signal: {ribbon_signal_type.value} | Score: {ribbon_score:.2f}")
+            print(f"MACD DIF: {dif:.6f} | MA99 Slope Up: {slope_up} | Flat: {flat}")
+            print(f"1s Split Trend: {split}")
+            print(f"Current Position: {self.position.value}")
+
+            # EXIT LOGIC
+            if self.position != PositionType.FLAT:
+
+                # TP / SL
+                roi = ((price - self.entry_price) / self.entry_price) * 100
+                if self.position == PositionType.SHORT:
+                    roi = ((self.entry_price - price) / self.entry_price) * 100
+
+                if roi >= TP_PERCENT:
+                    self.exit_position(price, reason="TP HIT")
+                    continue
+
+                if roi <= SL_PERCENT:
+                    self.exit_position(price, reason="SL HIT")
+                    continue
+
+                # Reversal conditions
+                if flat:
+                    self.exit_position(price, "MA99 FLAT")
+                    continue
+
+                if abs(dif) < 1e-12:
+                    self.exit_position(price, "DIF=0")
+                    continue
+
+                if self.position == PositionType.LONG and split == "DOWN":
+                    self.exit_position(price, "Split Reversal")
+                    continue
+
+                if self.position == PositionType.SHORT and split == "UP":
+                    self.exit_position(price, "Split Reversal")
+                    continue
+
+            # ENTRY LOGIC
+            if self.position == PositionType.FLAT:
+                enter_type = self.attempt_entry(
+                    price, ribbon_signal_type, ribbon_score,
+                    dif, slope_up, split
+                )
+                if enter_type != PositionType.FLAT:
+                    self.enter_position(enter_type, price)
+
+            time.sleep(1)
+
+
+
+# ==========================================================
+# RUN BOT
+# ==========================================================
+bot = HybridTrendBot(initial_balance=100.0)
+bot.run()
